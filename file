@@ -1,0 +1,246 @@
+"""
+Movie Twin Agent — GROQ VERSION (free, stable, fast)
+=====================================================
+Same design — ReAct pattern, 3 tools, persistent taste learning —
+using Groq's free API (OpenAI-compatible tool calling), because
+it's simpler and more stable than juggling Google's key formats.
+
+Get a free key: https://console.groq.com  (API Keys -> Create API Key)
+Keys look like: gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+Install:
+    pip install groq --break-system-packages
+
+Run (PowerShell):
+    $env:GROQ_API_KEY="gsk_your_key_here"
+    python movie_twin_agent_groq.py
+"""
+
+import os
+import json
+from pathlib import Path
+from groq import Groq
+
+MODEL = "openai/gpt-oss-120b"  # free-tier model on Groq (llama-3.3-70b-versatile is now Enterprise-only)
+PROFILE_DIR = Path("./taste_profiles")
+PROFILE_DIR.mkdir(exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# 1. MOCK MOVIE CATALOG
+# ---------------------------------------------------------------------------
+MOVIE_CATALOG = [
+    {"title": "Interstellar", "genre": ["sci-fi", "drama"], "mood": ["thoughtful", "epic"], "year": 2014, "director": "Christopher Nolan", "rating": 8.7},
+    {"title": "The Grand Budapest Hotel", "genre": ["comedy", "drama"], "mood": ["quirky", "light"], "year": 2014, "director": "Wes Anderson", "rating": 8.1},
+    {"title": "Parasite", "genre": ["thriller", "drama"], "mood": ["dark", "tense"], "year": 2019, "director": "Bong Joon-ho", "rating": 8.5},
+    {"title": "La La Land", "genre": ["romance", "musical"], "mood": ["dreamy", "bittersweet"], "year": 2016, "director": "Damien Chazelle", "rating": 8.0},
+    {"title": "Mad Max: Fury Road", "genre": ["action", "sci-fi"], "mood": ["intense", "adrenaline"], "year": 2015, "director": "George Miller", "rating": 8.1},
+    {"title": "Coco", "genre": ["animation", "family"], "mood": ["heartwarming"], "year": 2017, "director": "Lee Unkrich", "rating": 8.4},
+    {"title": "Whiplash", "genre": ["drama", "music"], "mood": ["intense", "tense"], "year": 2014, "director": "Damien Chazelle", "rating": 8.5},
+    {"title": "Knives Out", "genre": ["mystery", "comedy"], "mood": ["fun", "clever"], "year": 2019, "director": "Rian Johnson", "rating": 7.9},
+    {"title": "Arrival", "genre": ["sci-fi", "drama"], "mood": ["thoughtful", "quiet"], "year": 2016, "director": "Denis Villeneuve", "rating": 7.9},
+    {"title": "Everything Everywhere All at Once", "genre": ["sci-fi", "comedy"], "mood": ["chaotic", "heartwarming"], "year": 2022, "director": "Daniels", "rating": 7.8},
+    {"title": "The Dark Knight", "genre": ["action", "thriller"], "mood": ["intense", "dark"], "year": 2008, "director": "Christopher Nolan", "rating": 9.0},
+    {"title": "Amelie", "genre": ["romance", "comedy"], "mood": ["quirky", "light"], "year": 2001, "director": "Jean-Pierre Jeunet", "rating": 8.3},
+]
+
+
+def search_movies(genre: str = "", mood: str = "", keyword: str = "", min_year: int = 0):
+    """Search the catalog. All filters are optional and case-insensitive."""
+    results = []
+    for m in MOVIE_CATALOG:
+        if genre and genre.lower() not in [g.lower() for g in m["genre"]]:
+            continue
+        if mood and mood.lower() not in [x.lower() for x in m["mood"]]:
+            continue
+        if keyword and keyword.lower() not in m["title"].lower() and keyword.lower() not in m["director"].lower():
+            continue
+        if m["year"] < min_year:
+            continue
+        results.append(m)
+    return results if results else [{"info": "no matches found in catalog"}]
+
+
+# ---------------------------------------------------------------------------
+# 2. TASTE PROFILE (the "learning" memory)
+# ---------------------------------------------------------------------------
+def _profile_path(user_id: str) -> Path:
+    return PROFILE_DIR / f"{user_id}.json"
+
+
+def _default_profile():
+    return {"liked_genres": {}, "disliked_genres": {}, "liked_moods": {}, "watched": []}
+
+
+def get_taste_profile(user_id: str):
+    """Return everything the agent has learned about this user so far."""
+    path = _profile_path(user_id)
+    if not path.exists():
+        return _default_profile()
+    return json.loads(path.read_text())
+
+
+def record_feedback(user_id: str, title: str, rating: int, note: str = ""):
+    """
+    Update the taste profile based on user feedback about a movie.
+    rating: 1-5 (1 = disliked it, 5 = loved it)
+    """
+    profile = get_taste_profile(user_id)
+    movie = next((m for m in MOVIE_CATALOG if m["title"].lower() == title.lower()), None)
+    profile["watched"].append({"title": title, "rating": rating, "note": note})
+
+    if movie:
+        bucket = "liked_genres" if rating >= 4 else "disliked_genres" if rating <= 2 else None
+        if bucket:
+            for g in movie["genre"]:
+                profile[bucket][g] = profile[bucket].get(g, 0) + 1
+        if rating >= 4:
+            for mo in movie["mood"]:
+                profile["liked_moods"][mo] = profile["liked_moods"].get(mo, 0) + 1
+
+    _profile_path(user_id).write_text(json.dumps(profile, indent=2))
+    return {"status": "profile updated", "profile": profile}
+
+
+TOOL_FUNCTIONS = {
+    "search_movies": search_movies,
+    "get_taste_profile": get_taste_profile,
+    "record_feedback": record_feedback,
+}
+
+# ---------------------------------------------------------------------------
+# TOOL SCHEMAS (OpenAI-compatible format, which Groq uses)
+# ---------------------------------------------------------------------------
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_movies",
+            "description": "Search the movie catalog by genre, mood, keyword (title/director), and/or minimum year. Leave a field empty/omit it to ignore that filter.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "genre": {"type": "string", "description": "e.g. sci-fi, comedy, drama"},
+                    "mood": {"type": "string", "description": "e.g. thoughtful, intense, heartwarming, dark"},
+                    "keyword": {"type": "string", "description": "matches title or director"},
+                    "min_year": {"type": "integer", "description": "only movies released this year or later"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_taste_profile",
+            "description": "Get everything learned so far about this user's taste: liked/disliked genres, liked moods, and watch history with ratings. Always call this before recommending, if you haven't already this session.",
+            "parameters": {
+                "type": "object",
+                "properties": {"user_id": {"type": "string"}},
+                "required": ["user_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_feedback",
+            "description": "Save the user's rating/reaction to a movie so the agent learns their taste for future recommendations. Call this whenever the user rates, praises, or criticizes a movie.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "rating": {"type": "integer", "description": "1 (disliked) to 5 (loved)"},
+                    "note": {"type": "string", "description": "optional short reason"},
+                },
+                "required": ["user_id", "title", "rating"],
+            },
+        },
+    },
+]
+
+SYSTEM_PROMPT = """You are Movie Twin — a personalized movie recommendation agent that
+thinks and acts like a friend who really knows the user's taste.
+
+You follow the ReAct pattern internally: reason step by step (Thought), decide on a
+tool call (Action) when you need information, read the result (Observation), and
+repeat until you can give a confident, personalized Final Answer.
+
+Rules:
+- At the start of a new conversation, call get_taste_profile before recommending anything.
+- Use search_movies to find candidates that match both the user's request AND their
+  learned taste profile (favor genres/moods they've liked before; avoid ones they disliked).
+- When the user gives any rating or opinion on a movie ("I loved X", "X was boring",
+  "rate Interstellar 5/5"), call record_feedback so you actually learn from it.
+- Explain briefly WHY you're recommending something (tie it to their taste profile),
+  don't just list titles.
+- Keep responses conversational and concise, not a wall of text.
+"""
+
+
+# ---------------------------------------------------------------------------
+# ReAct LOOP
+# ---------------------------------------------------------------------------
+def run_agent_turn(client, user_id, messages, user_message, verbose=True):
+    messages.append({"role": "user", "content": user_message})
+
+    while True:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOLS,
+        )
+        msg = response.choices[0].message
+        messages.append(msg.model_dump(exclude_none=True))
+
+        if verbose and msg.content and msg.content.strip():
+            print(f"\n🎬 Movie Twin: {msg.content.strip()}")
+
+        if not msg.tool_calls:
+            break  # final answer given
+
+        for tc in msg.tool_calls:
+            fn = TOOL_FUNCTIONS[tc.function.name]
+            args = json.loads(tc.function.arguments)
+            if "user_id" in fn.__code__.co_varnames and "user_id" not in args:
+                args["user_id"] = user_id
+
+            if verbose:
+                print(f"   🔧 [Action] {tc.function.name}({args})")
+
+            result = fn(**args)
+
+            if verbose:
+                print(f"   👀 [Observation] {json.dumps(result)[:300]}")
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result),
+            })
+
+    return messages
+
+
+def main():
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        print("Set GROQ_API_KEY first (free key: https://console.groq.com)")
+        print('PowerShell: $env:GROQ_API_KEY="gsk_your_key_here"')
+        return
+
+    client = Groq(api_key=api_key)
+    user_id = input("Enter your name/user id: ").strip() or "guest"
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    print(f"\nHey {user_id}! I'm Movie Twin 🎬 — tell me what you're in the mood for,")
+    print("or rate a movie you've seen and I'll remember it. Type 'quit' to exit.\n")
+
+    while True:
+        user_message = input("You: ").strip()
+        if user_message.lower() in ("quit", "exit"):
+            break
+        messages = run_agent_turn(client, user_id, messages, user_message)
+
+
+if __name__ == "__main__":
+    main()
