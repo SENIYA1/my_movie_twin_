@@ -1,0 +1,46 @@
+# --- Secrets / env files ---
+.env
+.env.*
+!.env.example
+*.key
+secrets.json
+config/secrets*
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+venv/
+env/
+ENV/
+.venv/
+
+# --- Jupyter ---
+.ipynb_checkpoints
+
+# --- IDE / Editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- Logs / cache ---
+*.log
+.cache/
+.pytest_cache/
+
+# --- Data (optional, uncomment if you don't want to track datasets) ---
+# *.csv
+# *.db
+# *.sqlite3
